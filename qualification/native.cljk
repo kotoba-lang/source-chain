@@ -61,7 +61,7 @@
 (def code (path/join work "source-chain.bin"))
 (def offsets
   (into {}
-        (for [sym ["verify-chain" "head-tag" "fork-evidence"]]
+        (for [sym ["verify-chain" "head-tag" "fork-evidence" "verify-warrant" "replay-balance"]]
           (let [out (sh! (str "amu extract-native " sym) amu
                          ["extract-native" kexe "--symbol" sym "--output" code])
                 grab (fn [k] (some-> (re-find (re-pattern (str ":" k " (\\d+)")) out) second js/parseInt))]
@@ -120,12 +120,58 @@
       (let [e (entry {:kp kp :seq i :prev prev :ts (+ 1000 i) :content (content (str "c" i))})]
         (recur (inc i) (sha256-hex (:msg e)) (conj out e))))))
 
-(defn run [sym allow regions]
-  (let [{:keys [offset arity]} (get offsets sym)
-        argv (concat [code (str offset) (str arity) arch allow]
-                     (mapcat (fn [i r] [(str "g:" r) (str "gl:" i)]) (range) regions))
-        r (cp/spawnSync loader (clj->js argv) #js {:encoding "utf8"})]
-    (str/trim (str (.-stdout r) (.-stderr r)))))
+(defn run
+  ([sym allow regions] (run sym allow regions []))
+  ([sym allow regions extra]
+   (let [{:keys [offset arity]} (get offsets sym)
+         argv (concat [code (str offset) (str arity) arch allow]
+                      (mapcat (fn [i r] [(str "g:" r) (str "gl:" i)]) (range) regions)
+                      (map str extra))
+         r (cp/spawnSync loader (clj->js argv) #js {:encoding "utf8"})]
+     (str/trim (str (.-stdout r) (.-stderr r))))))
+
+(defn utf8-hex [s] (hex (js/Buffer.from s "utf8")))
+
+;; a warrant region: issuer key ++ sig ++ warrant message ++ entry A ++ entry B
+(defn warrant-message [{:keys [issuer accused seq a b rule]}]
+  (str "kotoba.warrant/v1\n"
+       "issuer:" issuer "\n"
+       "accused:" accused "\n"
+       "rule:" (or rule "fork") "\n"
+       "seq:" (pad20 seq) "\n"
+       "a:" a "\n"
+       "b:" b "\n"))
+
+(defn warrant [{:keys [kp signer ea eb] :as fields}]
+  (let [msg (warrant-message (merge {:issuer (:pub kp)} fields))]
+    (when-not (= 332 (count msg)) (die "warrant message is" (count msg) "bytes"))
+    (str (:pub kp) (sign-hex (or signer kp) msg) (utf8-hex msg) (:hex ea) (:hex eb))))
+
+;; a countersigned transfer record: spender key ++ receiver key ++ both sigs ++ message
+(defn transfer-message [{:keys [spender receiver amount amount-text nonce]}]
+  (str "kotoba.engi.transfer/v1\n"
+       "spender:" spender "\n"
+       "receiver:" receiver "\n"
+       "amount:" (or amount-text (pad20 amount)) "\n"
+       "nonce:" (sha256-hex (str "nonce-" nonce)) "\n"))
+
+(defn transfer [{:keys [from to receiver-signer] :as fields}]
+  (let [msg (transfer-message (merge {:spender (:pub from) :receiver (:pub to)} fields))]
+    (when-not (= 270 (count msg)) (die "transfer message is" (count msg) "bytes"))
+    {:id (sha256-hex msg)
+     :hex (str (:pub from) (:pub to) (sign-hex from msg) (sign-hex (or receiver-signer to) msg) (utf8-hex msg))}))
+
+;; a chain whose entries carry the given content ids, in order
+(defn chain-of [kp contents]
+  (loop [i 0 prev nil [c & more] contents out []]
+    (if (nil? c)
+      out
+      (let [e (entry {:kp kp :seq i :prev prev :ts (+ 5000 i) :content c})]
+        (recur (inc i) (sha256-hex (:msg e)) more (conj out e))))))
+
+
+;; replay-balance answers balance + 2^50; 2^50 + a small balance is exact in a JS number
+(defn balance-answer [b] (str (+ 1125899906842624 b)))
 
 ;; --- rows --------------------------------------------------------------------
 
@@ -198,6 +244,83 @@
     (check "not a fork: different seq: 0" (run F G [(:hex fa) (:hex other-seq)]) "0")
     (check "not a fork: different agents: 0" (run F G [(:hex fa) (:hex other-agent)]) "0")
     (check "no fork evidence from a forged signature: -3" (run F G [(:hex fa) (:hex forged)]) "-3"))
+  ;; --- warrant ---------------------------------------------------------------
+  (let [W "verify-warrant"
+        carol (keypair 7)
+        fa (entry {:kp alice :seq 1 :prev h0 :ts 1001 :content (content "spend-to-bob")})
+        fb (entry {:kp alice :seq 1 :prev h0 :ts 1001 :content (content "spend-to-carol")})
+        ha (sha256-hex (:msg fa)) hb (sha256-hex (:msg fb))
+        base {:kp carol :accused (:pub alice) :seq 1 :a ha :b hb :ea fa :eb fb}]
+    (check "warrant with its fork as evidence verifies: 1" (run W G [(warrant base)]) "1")
+    (check "warrant signed by someone other than its issuer: -3"
+           (run W G [(warrant (assoc base :signer mallory))]) "-3")
+    (check "warrant whose issuer line names another key: -5"
+           (run W G [(warrant (assoc base :issuer (:pub mallory)))]) "-5")
+    (check "warrant whose evidence is not a fork: -8"
+           (run W G [(warrant (assoc base :b ha :eb fa))]) "-8")
+    (check "warrant naming the wrong seq: -9" (run W G [(warrant (assoc base :seq 2))]) "-9")
+    (check "warrant accusing someone other than the forked agent: -9"
+           (run W G [(warrant (assoc base :accused (:pub carol)))]) "-9")
+    (check "warrant whose hashes do not name its evidence: -9"
+           (run W G [(warrant (assoc base :b (content "elsewhere")))]) "-9")
+    (check "warrant naming its evidence in the other order: -9"
+           (run W G [(warrant (assoc base :a hb :b ha))]) "-9")
+    (check "warrant carrying forged evidence: -3"
+           (run W G [(warrant (assoc base :eb (entry {:kp alice :signer mallory :seq 1 :prev h0 :ts 1001
+                                                       :content (content "spend-to-carol")})))])
+           "-3")
+    (check "warrant for a rule it does not know: -4"
+           (run W G [(warrant (assoc base :rule "fake"))]) "-4")
+    (check "warrant region one byte short: -6"
+           (run W G [(let [w (warrant base)] (subs w 0 (- (count w) 2)))]) "-6"))
+  ;; --- mutual credit replay ----------------------------------------------------
+  (let [R "replay-balance"
+        bob (keypair 11)
+        carol (keypair 7)
+        t1 (transfer {:from alice :to bob :amount 30 :nonce 1})
+        t2 (transfer {:from bob :to alice :amount 10 :nonce 2})
+        c0 (content "plain entry")
+        region (fn [kp contents transfers] (str (hex-of (chain-of kp contents)) (apply str (map :hex transfers))))
+        a-region (region alice [c0 (:id t1) (:id t2)] [t1 t2])
+        b-region (region bob [(:id t1) (:id t2)] [t1 t2])
+        a-answer (run R G [a-region] [3 100])
+        b-answer (run R G [b-region] [2 100])]
+    (check "spender's replay: -30 +10 = -20" a-answer (balance-answer -20))
+    (check "receiver's replay: +30 -10 = +20" b-answer (balance-answer 20))
+    (check "mutual credit is net zero across both chains"
+           (+ (- (js/parseInt a-answer) 1125899906842624) (- (js/parseInt b-answer) 1125899906842624)) 0)
+    (check "a chain with no transfers replays to zero"
+           (run R G [(region alice [c0] [])] [1 0]) (balance-answer 0))
+    (check "credit limit exactly reached at the lowest point, -30, is allowed (limit 30)"
+           (run R G [a-region] [3 30]) (balance-answer -20))
+    (check "credit limit exceeded by one at the lowest point: -10" (run R G [a-region] [3 29]) "-10")
+    (check "transfer no entry references: -11"
+           (run R G [(region alice [c0 (:id t1)] [t1 t2])] [2 100]) "-11")
+    (check "transfer referenced twice (would count twice): -12"
+           (run R G [(region alice [(:id t1) (:id t1)] [t1])] [2 100]) "-12")
+    (check "transfers out of chain order: -14"
+           (run R G [(region alice [(:id t1) (:id t2)] [t2 t1])] [2 100]) "-14")
+    (let [t3 (transfer {:from carol :to bob :amount 5 :nonce 3})]
+      (check "transfer the chain's agent is not party to: -13"
+             (run R G [(region alice [(:id t3)] [t3])] [1 100]) "-13"))
+    (let [t4 (transfer {:from alice :to bob :amount 5 :nonce 4 :receiver-signer mallory})]
+      (check "transfer the receiver did not countersign: -3"
+             (run R G [(region alice [(:id t4)] [t4])] [1 100]) "-3"))
+    (let [t5 (transfer {:from alice :to bob :amount 0 :nonce 5})]
+      (check "zero amount: -4" (run R G [(region alice [(:id t5)] [t5])] [1 100]) "-4"))
+    (let [t6 (transfer {:from alice :to bob :amount-text "00000001000000000000" :nonce 6})]
+      (check "amount above the bound: -4" (run R G [(region alice [(:id t6)] [t6])] [1 100]) "-4"))
+    (let [t7 (transfer {:from alice :to alice :amount 5 :nonce 7})]
+      (check "transfer to oneself: -4" (run R G [(region alice [(:id t7)] [t7])] [1 100]) "-4"))
+    (check "region that is not chain plus whole transfers: -6"
+           (run R G [(str a-region "00")] [3 100]) "-6")
+    (check "no chain at all: -6" (run R G [a-region] [0 100]) "-6")
+    (check "a tampered chain is refused before any transfer counts: -3"
+           (run R G [(let [es (chain-of alice [c0 (:id t1)])]
+                       (str (:hex (first es)) (:pub alice) (apply str (repeat 128 "0"))
+                            (utf8-hex (:msg (second es))) (:hex t1)))]
+                [2 100])
+           "-3"))
   (check "without the verify grant the guest traps, it does not answer"
          (str/includes? (run V "3" [(hex-of three)]) "SIGTRAP") true)
   (check "without the sha256 grant the guest traps, it does not answer"
