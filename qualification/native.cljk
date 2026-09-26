@@ -1,0 +1,214 @@
+;; Native qualification for kotoba.source-chain.
+;;
+;; Compiles kotoba/source_chain.kotoba with amu for this host's native target,
+;; extracts the three exports, builds amu's C kexe loader, then builds signed
+;; entries on the host and asks the compiled guest through the loader. Every
+;; answer is pinned, including the reason code of each refusal; the two
+;; missing-grant rows pin that the guest TRAPS rather than answers.
+;;
+;; Ed25519 signing happens here, on the host, because signing is the key
+;; holder's job (kagi in production). The guest only verifies.
+;;
+;; usage (from this repository's root):
+;;   kbb --backend sci qualification/native.cljk [--amu <amu checkout>]
+;; default --amu is ../amu (the west layout: orgs/kotoba-lang/amu).
+;;
+;; exit 0: every row passed   1: a row failed   3: could not run (build,
+;; toolchain or arguments) -- never reported as a pass.
+(ns qualification.native
+  (:require ["crypto" :as crypto]
+            ["child_process" :as cp]
+            ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as path]
+            [clojure.string :as str]))
+
+(defn die [& msg] (apply println "COULD-NOT-RUN" msg) (js/process.exit 3))
+
+;; --- arguments: everything after this script's own path ----------------------
+
+(def args
+  (let [argv (vec js/process.argv)
+        i (first (keep-indexed (fn [i a] (when (str/ends-with? a "native.cljk") i)) argv))]
+    (when-not i (die "cannot find the script in argv" (pr-str argv)))
+    (subvec argv (inc i))))
+
+(def amu-dir
+  (let [i (.indexOf (clj->js args) "--amu")]
+    (path/resolve (if (>= i 0) (nth args (inc i)) "../amu"))))
+
+(def arch (case (os/arch) "arm64" "aarch64" "x64" "x86_64" (die "unsupported host arch" (os/arch))))
+(def work (fs/mkdtempSync (path/join (os/tmpdir) "source-chain-native-")))
+
+(defn sh! [what cmd argv]
+  (let [r (cp/spawnSync cmd (clj->js argv) #js {:encoding "utf8"})]
+    (when (or (.-error r) (not= 0 (.-status r)))
+      (die what "failed:" (str (.-error r)) (str/trim (str (.-stdout r) (.-stderr r)))))
+    (str (.-stdout r))))
+
+;; --- build -------------------------------------------------------------------
+
+(def guest (path/resolve "kotoba/source_chain.kotoba"))
+(when-not (fs/existsSync guest) (die "run from the repository root; missing" guest))
+(def amu (path/join amu-dir "bin/amu"))
+(when-not (fs/existsSync amu) (die "no amu at" amu "(pass --amu <dir>)"))
+
+(def policy (path/join work "policy.edn"))
+(fs/writeFileSync policy "{:allow #{[:cap/call 2] [:cap/call 3]}}")
+(def kexe (path/join work "source-chain.kexe"))
+(sh! "amu compile" amu ["compile" guest "--policy" policy "--output" kexe])
+
+(def code (path/join work "source-chain.bin"))
+(def offsets
+  (into {}
+        (for [sym ["verify-chain" "head-tag" "fork-evidence"]]
+          (let [out (sh! (str "amu extract-native " sym) amu
+                         ["extract-native" kexe "--symbol" sym "--output" code])
+                grab (fn [k] (some-> (re-find (re-pattern (str ":" k " (\\d+)")) out) second js/parseInt))]
+            [sym {:offset (grab "offset") :arity (grab "arity")}]))))
+(when (some (fn [[_ v]] (or (nil? (:offset v)) (nil? (:arity v)))) offsets)
+  (die "could not read offsets" (pr-str offsets)))
+
+(def loader (path/join work "kexe-loader"))
+(sh! "cc kexe_loader.c" "cc" ["-O2" "-o" loader (path/join amu-dir "tools/kexe_loader.c")])
+
+;; --- entries -----------------------------------------------------------------
+
+(defn hex [^js buf] (.toString buf "hex"))
+(defn sha256-hex [s] (-> (crypto/createHash "sha256") (.update s "utf8") (.digest "hex")))
+
+(defn keypair [seed-byte]
+  (let [seed (js/Buffer.alloc 32 seed-byte)
+        der (js/Buffer.concat #js [(js/Buffer.from "302e020100300506032b657004220420" "hex") seed])
+        priv (crypto/createPrivateKey #js {:key der :format "der" :type "pkcs8"})
+        pub-der (.export (crypto/createPublicKey priv) #js {:format "der" :type "spki"})]
+    {:priv priv :pub (hex (.subarray pub-der 12))}))
+
+;; the retired Rust tests used these seeds: [42u8; 32] and [99u8; 32]
+(def alice (keypair 42))
+(def mallory (keypair 99))
+
+(defn pad20 [n] (let [s (str n)] (str (apply str (repeat (- 20 (count s)) "0")) s)))
+(def open-policy (sha256-hex "kotoba.data-policy/open"))
+
+(defn message [{:keys [agent seq prev ts policy content header]}]
+  (str (or header "kotoba.source-chain/v1") "\n"
+       "agent:" agent "\n"
+       "seq:" (pad20 seq) "\n"
+       "prev:" (or prev (apply str (repeat 64 "-"))) "\n"
+       "ts:" (pad20 ts) "\n"
+       "policy:" (or policy open-policy) "\n"
+       "content:" content "\n"))
+
+(defn sign-hex [kp msg]
+  (hex (crypto/sign nil (js/Buffer.from msg "utf8") (:priv kp))))
+
+;; one 454-byte entry as hex: key ++ sig ++ message. `key` and `signer`
+;; default to the message's own agent so each vector changes one thing.
+(defn entry [{:keys [kp key signer] :as fields}]
+  (let [msg (message (assoc fields :agent (or (:agent fields) (:pub kp))))]
+    (when-not (= 358 (count msg)) (die "vector message is" (count msg) "bytes"))
+    {:msg msg
+     :hex (str (or key (:pub kp)) (sign-hex (or signer kp) msg) (hex (js/Buffer.from msg "utf8")))}))
+
+(defn content [s] (sha256-hex s))
+
+(defn chain [kp n]
+  (loop [i 0 prev nil out []]
+    (if (= i n)
+      out
+      (let [e (entry {:kp kp :seq i :prev prev :ts (+ 1000 i) :content (content (str "c" i))})]
+        (recur (inc i) (sha256-hex (:msg e)) (conj out e))))))
+
+(defn run [sym allow regions]
+  (let [{:keys [offset arity]} (get offsets sym)
+        argv (concat [code (str offset) (str arity) arch allow]
+                     (mapcat (fn [i r] [(str "g:" r) (str "gl:" i)]) (range) regions))
+        r (cp/spawnSync loader (clj->js argv) #js {:encoding "utf8"})]
+    (str/trim (str (.-stdout r) (.-stderr r)))))
+
+;; --- rows --------------------------------------------------------------------
+
+(def results (atom []))
+(defn check [label actual expected]
+  (swap! results conj {:label label :ok (= actual expected) :actual actual :expected expected}))
+
+(let [three (chain alice 3)
+      hex-of (fn [es] (apply str (map :hex es)))
+      [e0 e1 _] three
+      h0 (sha256-hex (:msg e0))
+      V "verify-chain" H "head-tag" F "fork-evidence" G "2,3"]
+  (check "valid chain of 3 verifies with count 3" (run V G [(hex-of three)]) "3")
+  (check "a single genesis entry verifies" (run V G [(hex-of [e0])]) "1")
+  (check "head-tag is the host sha256 prefix of the last message"
+         (run H G [(hex-of three)])
+         ;; BigInt: 60 bits do not survive a JS number (2^53)
+         (.toString (js/BigInt (str "0x" (subs (sha256-hex (:msg (last three))) 0 15)))))
+  (check "region that is not whole entries: -6" (run V G [(str (hex-of three) "00")]) "-6")
+  (check "content byte tampered after signing: -3"
+         (run V G [(hex-of [e0 (update e1 :hex #(str (subs % 0 (- (count %) 4)) "30" (subs % (- (count %) 2))))])])
+         "-3")
+  (check "data policy changed after signing: -3"
+         (let [m (message {:agent (:pub alice) :seq 1 :prev h0 :ts 1001
+                           :policy (sha256-hex "kotoba.data-policy/encrypted") :content (content "c1")})]
+           (run V G [(str (:hex e0) (:pub alice) (sign-hex alice (:msg e1)) (hex (js/Buffer.from m "utf8")))]))
+         "-3")
+  (check "zeroed signature: -3"
+         (run V G [(str (:hex e0) (:pub alice) (apply str (repeat 128 "0")) (hex (js/Buffer.from (:msg e1) "utf8")))])
+         "-3")
+  (check "signed by another key under this agent's key and name: -3"
+         (run V G [(hex-of [e0 (entry {:kp alice :signer mallory :seq 1 :prev h0 :ts 1001 :content (content "c1")})])])
+         "-3")
+  (check "a second agent's entry inside this chain: -5"
+         (run V G [(hex-of [e0 (entry {:kp mallory :seq 1 :prev h0 :ts 1001 :content (content "c1")})])])
+         "-5")
+  (check "message names one agent, key bytes are another: -5"
+         (run V G [(hex-of [(entry {:kp alice :agent (:pub mallory) :key (:pub alice) :seq 0 :ts 1 :content (content "x")})])])
+         "-5")
+  (check "correctly signed entry at the wrong seq: -1"
+         (run V G [(hex-of [e0 (entry {:kp alice :seq 2 :prev h0 :ts 1001 :content (content "c1")})])])
+         "-1")
+  (check "correctly signed entry naming the wrong prev: -2"
+         (run V G [(hex-of [e0 (entry {:kp alice :seq 1 :prev (content "not-the-head") :ts 1001 :content (content "c1")})])])
+         "-2")
+  (check "genesis that names a prev: -2"
+         (run V G [(hex-of [(entry {:kp alice :seq 0 :prev (content "ghost") :ts 1 :content (content "x")})])])
+         "-2")
+  (check "non-ASCII byte in the message: -4"
+         (run V G [(str (:pub alice) (sign-hex alice (:msg e0)) "ff" (subs (hex (js/Buffer.from (:msg e0) "utf8")) 2))])
+         "-4")
+  (check "wrong schema line: -4"
+         (run V G [(:hex (entry {:kp alice :header "kotoba.source-chain/v0" :seq 0 :ts 1 :content (content "x")}))])
+         "-4")
+  (check "empty region is an empty chain: 0" (run V G [""]) "0")
+  (check "empty chain has no head: -7" (run H G [""]) "-7")
+  (check "seq/ts digit boundary does not collide (distinct heads)"
+         (let [a (entry {:kp alice :seq 0 :ts 123 :content (content "x")})
+               b (entry {:kp alice :seq 0 :ts 1230 :content (content "x")})
+               ha (run H G [(:hex a)]) hb (run H G [(:hex b)])]
+           (and (re-matches #"\d+" ha) (re-matches #"\d+" hb) (not= ha hb)))
+         true)
+  (let [fa (entry {:kp alice :seq 1 :prev h0 :ts 1001 :content (content "spend-to-bob")})
+        fb (entry {:kp alice :seq 1 :prev h0 :ts 1001 :content (content "spend-to-carol")})
+        other-seq (entry {:kp alice :seq 2 :prev h0 :ts 1002 :content (content "later")})
+        other-agent (entry {:kp mallory :seq 1 :prev h0 :ts 1001 :content (content "spend-to-carol")})
+        forged (entry {:kp alice :signer mallory :seq 1 :prev h0 :ts 1001 :content (content "spend-to-carol")})]
+    (check "fork: same agent, same seq, different content: 1" (run F G [(:hex fa) (:hex fb)]) "1")
+    (check "not a fork: the same entry twice: 0" (run F G [(:hex fa) (:hex fa)]) "0")
+    (check "not a fork: different seq: 0" (run F G [(:hex fa) (:hex other-seq)]) "0")
+    (check "not a fork: different agents: 0" (run F G [(:hex fa) (:hex other-agent)]) "0")
+    (check "no fork evidence from a forged signature: -3" (run F G [(:hex fa) (:hex forged)]) "-3"))
+  (check "without the verify grant the guest traps, it does not answer"
+         (str/includes? (run V "3" [(hex-of three)]) "SIGTRAP") true)
+  (check "without the sha256 grant the guest traps, it does not answer"
+         (str/includes? (run V "2" [(hex-of three)]) "SIGTRAP") true))
+
+(let [rs @results
+      bad (remove :ok rs)]
+  (doseq [r rs]
+    (println (if (:ok r) "PASS" "FAIL") (:label r)
+             (if (:ok r) "" (str "  actual=" (pr-str (:actual r)) " expected=" (pr-str (:expected r))))))
+  (println (str "SCANNED\t" (count rs) "\tPASSED\t" (- (count rs) (count bad)) "\tFAILED\t" (count bad)
+                "\tTARGET\t" arch))
+  (fs/rmSync work #js {:recursive true :force true})
+  (js/process.exit (cond (zero? (count rs)) 3 (seq bad) 1 :else 0)))
