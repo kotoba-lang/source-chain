@@ -190,16 +190,39 @@ leaves to its caller: a transfer's message is itself a document of schema
 ## Qualification
 
 ```bash
-kbb --backend sci qualification/native.cljk [--amu ../amu]
+kbb --backend sci qualification/native.cljk [--amu ../amu] \
+    [--platform host|linux-podman] [--isa aarch64|x86_64]
 ```
 
 This compiles the guest for the host's native target, extracts the exports,
 builds `amu/tools/kexe_loader.c`, and signs vectors on the host. Signing is
 the key holder's job, so the guest only verifies. Every row pins the exact
-answer. Two rows pin that the guest traps (SIGTRAP) without the verify or
-sha256 grant, rather than answering. A guest with the prev check, the
-warrant's evidence-hash check, or the double-count guard removed fails
-exactly the row that names it.
+answer. Two rows pin that the guest traps without the verify or sha256
+grant, rather than answering. The trap is SIGTRAP on aarch64 and SIGILL on
+x86_64. Guests with any of these checks removed fail exactly the row that
+names the check:
+
+- the prev check;
+- the warrant's evidence-hash check;
+- the double-count guard;
+- the genesis DNA check;
+- the schema check.
+
+`--platform linux-podman` compiles for `<isa>-linux` and runs inside the
+podman machine. The loaders are built static in the `localhost/c3-gcc`
+container, as amu's `scripts/test-linux-static-handlers.cljk` does. The run
+sets `vm.overcommit_memory=1` for the loader's shared-state mmap and puts
+the old value back afterwards.
+
+Measured 2026-09-27, all 70 rows passing on each of these:
+
+| platform | loader |
+|---|---|
+| macOS aarch64 | host build |
+| Linux aarch64 (Fedora CoreOS 6.15) | production build, seccomp filter in force |
+| Linux x86_64 | `qemu-x86_64-static`, built `-DKEXE_SANITIZER_TEST`, because qemu-user cannot install a guest-arch seccomp filter |
+
+x86_64 has not been run on real hardware.
 
 Exit codes:
 
@@ -224,4 +247,9 @@ The following parts of ADR-2609261900 are not done yet:
 - Warrant tally across distinct issuers (K/2), and gossip. These are stage
   D.
 - Networking, which is stage B.
-- Running on x86_64 and Linux static ELF, which has not been measured.
+- The Linux static ELF target (`<isa>-linux-static`). amu refuses it for
+  two measured reasons: a static image must be a program with a
+  zero-arity `main` (these are library exports taking granted regions), and
+  a static image has no handler for wire 3, `:hash/sha256`. The same
+  missing-handler reason is expected for wire 2, `:identity/verify`. Until
+  those handlers exist, the kexe loader is the Linux path.
