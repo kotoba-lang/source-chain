@@ -13,7 +13,7 @@ to stay compatible with.
 
 ## What the guest answers
 
-`kotoba/source_chain.kotoba` exports five functions. All take granted
+`kotoba/source_chain.kotoba` exports six functions. All take granted
 regions (base address and length handed in by the loader) and answer an i64.
 
 | export | answers |
@@ -23,6 +23,7 @@ regions (base address and length handed in by the loader) and answer an i64.
 | `fork-evidence a-base a-len b-base b-len` | `1` when two validly signed entries by the same agent share a seq but differ; `0` when they do not; a negative reason when either does not verify |
 | `verify-warrant base len` | `1` when a warrant verifies together with the fork it carries as evidence, or a negative reason |
 | `replay-balance base len n credit-limit` | an agent's mutual-credit balance **plus 2^50** (so every balance is a non-negative answer), or a negative reason |
+| `validate-dna base len n mlen` | number of entries in a chain that lives under the DNA and whose every document is resolved and admitted, or a negative reason |
 
 Negative reasons:
 
@@ -41,6 +42,11 @@ Negative reasons:
 | -12 | a transfer is referenced by more than one entry (it would count twice) |
 | -13 | the chain's agent is neither the spender nor the receiver |
 | -14 | transfers are not in the order of the entries that reference them |
+| -15 | a content document is missing, or its sha256 is not the entry's content |
+| -16 | a content document is longer than the DNA's `max-content` |
+| -17 | a content document's schema is not allowed by the DNA |
+| -18 | the genesis entry's content is not the DNA id |
+| -19 | the DNA manifest is malformed or not canonical |
 
 Checks run in this order: malformed, agent, signature, seq, prev. An
 untrusted entry is authenticated before its position is believed.
@@ -141,6 +147,46 @@ apply:
 - Completeness is the caller's job: the replay counts only the transfers
   it is given.
 
+## DNA (v1)
+
+A DNA is the rule set a chain lives under. It is named by its content: the
+DNA id is the sha256 of its manifest. The manifest is ASCII, one field per
+LF-terminated line:
+
+```
+kotoba.dna/v1
+name:<1..64 printable characters>
+version:<1..64 printable characters>
+max-content:<1..6 decimal digits>
+allow:<schema>          (one or more, strictly ascending)
+end
+```
+
+Ascending `allow` lines make the manifest canonical, so one rule set has one
+id. An unsorted or repeated line is refused, not re-sorted. A chain lives
+under a DNA when both of these hold:
+
+- its genesis entry's content is the DNA id (Holochain's genesis records the
+  DNA hash the same way);
+- every later entry's content is resolved: the caller supplies the document
+  whose sha256 the entry names, and that document is
+  - printable ASCII,
+  - no longer than `max-content`,
+  - of a schema the DNA allows. The schema is the document's first line.
+
+`validate-dna` takes one region:
+
+```
+[manifest][chain n*454][record for entry 1]...[record for entry n-1]
+record = [length: 2 bytes big-endian][document]
+```
+
+With every document resolved, no content can sit in the chain as an opaque
+hash that the DNA never admitted. A validator holding the documents sees
+every transfer the chain names. That is the completeness `replay-balance`
+leaves to its caller: a transfer's message is itself a document of schema
+`kotoba.engi.transfer/v1`.
+
 ## Qualification
 
 ```bash
@@ -169,9 +215,13 @@ Inside the superproject, run it through `scripts/resource-guard.mjs run build
 
 The following parts of ADR-2609261900 are not done yet:
 
-- DNA validation rules: which content an entry may carry. That decides
-  whether a transfer id refers to a real transfer.
-- Warrant tally across distinct issuers (K/2), and gossip. These are stages
-  C and D.
+- Richer DNA rules than schema, size and resolution. For example, a rule
+  per schema over the document's fields, which the Rust `RuleSpec` expressed
+  over datoms.
+- One call that joins `validate-dna` and `replay-balance`. Today a caller
+  composes them: first check that every transfer document is resolved, then
+  replay exactly those transfers.
+- Warrant tally across distinct issuers (K/2), and gossip. These are stage
+  D.
 - Networking, which is stage B.
 - Running on x86_64 and Linux static ELF, which has not been measured.

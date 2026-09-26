@@ -61,7 +61,7 @@
 (def code (path/join work "source-chain.bin"))
 (def offsets
   (into {}
-        (for [sym ["verify-chain" "head-tag" "fork-evidence" "verify-warrant" "replay-balance"]]
+        (for [sym ["verify-chain" "head-tag" "fork-evidence" "verify-warrant" "replay-balance" "validate-dna"]]
           (let [out (sh! (str "amu extract-native " sym) amu
                          ["extract-native" kexe "--symbol" sym "--output" code])
                 grab (fn [k] (some-> (re-find (re-pattern (str ":" k " (\\d+)")) out) second js/parseInt))]
@@ -172,6 +172,25 @@
 
 ;; replay-balance answers balance + 2^50; 2^50 + a small balance is exact in a JS number
 (defn balance-answer [b] (str (+ 1125899906842624 b)))
+
+;; a DNA manifest, as written (allow lines in the order given)
+(defn manifest [{:keys [name version max allows]}]
+  (str "kotoba.dna/v1\n" "name:" name "\n" "version:" version "\n"
+       "max-content:" max "\n" (apply str (map #(str "allow:" % "\n") allows)) "end\n"))
+
+(defn hex4 [n] (let [s (.toString n 16)] (str (apply str (repeat (- 4 (count s)) "0")) s)))
+
+;; a content record: 2-byte big-endian length ++ document
+(defn record [doc] (str (hex4 (.-length (js/Buffer.from doc "utf8"))) (utf8-hex doc)))
+
+;; region for validate-dna: manifest ++ chain ++ records. The chain's genesis
+;; names `genesis` (the DNA id unless overridden), later entries name docs.
+(defn dna-region [{:keys [kp m docs genesis records extra]}]
+  (let [contents (cons (or genesis (sha256-hex m)) (map sha256-hex docs))]
+    {:region (str (utf8-hex m) (apply str (map :hex (chain-of kp contents)))
+                  (apply str (or records (map record docs))) (or extra ""))
+     :n (count contents)
+     :mlen (.-length (js/Buffer.from m "utf8"))}))
 
 ;; --- rows --------------------------------------------------------------------
 
@@ -321,6 +340,58 @@
                             (utf8-hex (:msg (second es))) (:hex t1)))]
                 [2 100])
            "-3"))
+  ;; --- DNA ---------------------------------------------------------------------
+  (let [D "validate-dna"
+        spec {:name "market" :version "1.0.0" :max 400
+              :allows ["kotoba.engi.transfer/v1" "kotoba.post/v1"]}
+        m (manifest spec)
+        post "kotoba.post/v1\nhello from alice\n"
+        bob (keypair 11)
+        tmsg (transfer-message {:spender (:pub alice) :receiver (:pub bob) :amount 30 :nonce 1})
+        v (fn [{:keys [region n mlen]}] (run D G [region] [n mlen]))]
+    (check "chain under its DNA with every document resolved: 3"
+           (v (dna-region {:kp alice :m m :docs [post tmsg]})) "3")
+    (check "genesis alone under its DNA: 1" (v (dna-region {:kp alice :m m :docs []})) "1")
+    (check "allow lines out of order are not canonical: -19"
+           (v (dna-region {:kp alice :m (manifest (update spec :allows reverse)) :docs []})) "-19")
+    (check "a repeated allow line is not canonical: -19"
+           (v (dna-region {:kp alice :m (manifest (assoc spec :allows ["kotoba.post/v1" "kotoba.post/v1"])) :docs []}))
+           "-19")
+    (check "bytes after the end line: -19"
+           (v (dna-region {:kp alice :m (str m "x\n") :docs []})) "-19")
+    (check "max-content wider than 6 digits: -19"
+           (v (dna-region {:kp alice :m (manifest (assoc spec :max 1000000)) :docs []})) "-19")
+    (check "genesis that does not name the DNA: -18"
+           (v (dna-region {:kp alice :m m :docs [] :genesis (content "no dna")})) "-18")
+    (check "same rules, bumped version, is another DNA: -18"
+           (v (dna-region {:kp alice :m (manifest (assoc spec :version "1.1.0")) :docs []
+                           :genesis (sha256-hex m)}))
+           "-18")
+    (check "an entry whose document is not supplied: -15"
+           (v (dna-region {:kp alice :m m :docs [post tmsg] :records [(record post)]})) "-15")
+    (check "a document that is not the one the entry names: -15"
+           (v (dna-region {:kp alice :m m :docs [post] :records [(record "kotoba.post/v1\nedited\n")]})) "-15")
+    (let [at-max (str "kotoba.post/v1\n" (apply str (repeat (- 400 16) "a")) "\n")
+          over (str "kotoba.post/v1\n" (apply str (repeat (- 401 16) "a")) "\n")]
+      (check "a document exactly max-content long is allowed: 2"
+             (v (dna-region {:kp alice :m m :docs [at-max]})) "2")
+      (check "a document one byte over max-content: -16"
+             (v (dna-region {:kp alice :m m :docs [over]})) "-16"))
+    (check "a document whose schema the DNA does not allow: -17"
+           (v (dna-region {:kp alice :m m :docs ["kotoba.secret/v1\nshh\n"]})) "-17")
+    (check "a document with no schema line: -4"
+           (v (dna-region {:kp alice :m m :docs ["no newline at all"]})) "-4")
+    (check "bytes after the last record: -6"
+           (v (dna-region {:kp alice :m m :docs [post] :extra "00"})) "-6")
+    (check "a tampered entry inside a DNA region: -3"
+           (let [{:keys [region n mlen]} (dna-region {:kp alice :m m :docs [post]})
+                 cut (+ (* 2 mlen) (* 2 454) (* 2 32))]
+             (run D G [(str (subs region 0 cut) (apply str (repeat 128 "0")) (subs region (+ cut 128)))] [n mlen]))
+           "-3")
+    (check "manifest length past the region: -6"
+           (let [{:keys [region n]} (dna-region {:kp alice :m m :docs []})]
+             (run D G [region] [n 100000]))
+           "-6"))
   (check "without the verify grant the guest traps, it does not answer"
          (str/includes? (run V "3" [(hex-of three)]) "SIGTRAP") true)
   (check "without the sha256 grant the guest traps, it does not answer"

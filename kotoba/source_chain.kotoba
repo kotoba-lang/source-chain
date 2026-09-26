@@ -33,7 +33,7 @@
 ;; untrusted entry is authenticated before its position is believed.
 
 (ns kotoba.source-chain
-  (:export [verify-chain head-tag fork-evidence verify-warrant replay-balance])
+  (:export [verify-chain head-tag fork-evidence verify-warrant replay-balance validate-dna])
   (:capabilities #{:identity/verify :hash/sha256}))
 
 (defn- entry-size [] :i64 454)
@@ -94,8 +94,14 @@
     1
     (if (= (string-code-point-at t (+ at i)) 45) (dash-run t at (+ i 1) n) 0)))
 
+;; 1 when `expected` sits at `at`. A span past the end is an answer (0), not
+;; a substring the runtime refuses -- string-substring traps (SIGILL) there,
+;; which a variable-length manifest reaches when its last line is shorter
+;; than the prefix being tried.
 (defn- lit [t :string at :i64 expected :string] :i64
-  (if (string=? (string-substring t at (+ at (string-byte-length expected))) expected) 1 0))
+  (if (> (+ at (string-byte-length expected)) (string-byte-length t))
+    0
+    (if (string=? (string-substring t at (+ at (string-byte-length expected))) expected) 1 0)))
 
 (defn- lf [t :string at :i64] :i64
   (if (= (string-code-point-at t at) 10) 1 0))
@@ -167,15 +173,15 @@
 ;; --- the chain --------------------------------------------------------------
 
 ;; walks entries i..n-1; answers n on success, or the first negative reason
-(defn- walk [s [:slice :u8] base :i64 i :i64 n :i64 key-hex :string prev-hash :string] :i64
+(defn- walk [s [:slice :u8] base :i64 origin :i64 i :i64 n :i64 key-hex :string prev-hash :string] :i64
   (if (>= i n)
     n
-    (let [at (* i (entry-size))
+    (let [at (+ origin (* i (entry-size)))
           t (entry-text s at)
           verdict (check-entry s base at t i key-hex prev-hash)]
       (if (< verdict 0)
         verdict
-        (walk s base (+ i 1) n key-hex (sha256 t))))))
+        (walk s base origin (+ i 1) n key-hex (sha256 t))))))
 
 (defn- entry-count [len :i64] :i64
   (if (= len (* (quot len (entry-size)) (entry-size))) (quot len (entry-size)) -6))
@@ -189,7 +195,7 @@
       (if (= n 0)
         0
         (let [s (slice-of-u8 base len)]
-          (walk s base 0 n (key-hex-from s 0 0) ""))))))
+          (walk s base 0 0 n (key-hex-from s 0 0) ""))))))
 
 ;; --- head ------------------------------------------------------------------
 
@@ -425,7 +431,139 @@
     (if (= 0 (if (= rest (* (quot rest (transfer-size)) (transfer-size))) 1 0)) -6
       (let [s (slice-of-u8 base len)
             key-hex (key-hex-from s 0 0)
-            verdict (walk s base 0 n key-hex "")]
+            verdict (walk s base 0 0 n key-hex "")]
         (if (< verdict 0)
           verdict
           (replay s base n 0 (quot rest (transfer-size)) key-hex credit-limit -1 0))))))))
+
+;; --- DNA ---------------------------------------------------------------------
+;;
+;; A DNA is the rule set a chain lives under, named by its content: the DNA
+;; id is sha256 of the manifest (reference dna.rs dna_id). The manifest is
+;; ASCII, one field per LF-terminated line:
+;;
+;;   kotoba.dna/v1
+;;   name:<1..64 printable characters>
+;;   version:<1..64 printable characters>
+;;   max-content:<1..6 decimal digits: the largest content document, bytes>
+;;   allow:<schema>          one or more, strictly ascending
+;;   end
+;;
+;; Ascending allow lines make the manifest canonical, so the same rule set
+;; has one id however it was written (the Rust with_rule sorted for the same
+;; reason); an unsorted or repeated allow line is refused, not re-sorted.
+;;
+;; A chain lives under a DNA when its genesis entry's content IS the DNA id
+;; (Holochain's genesis records the DNA hash the same way), and every later
+;; entry's content is resolved: the caller supplies the document whose sha256
+;; the entry names, it is ASCII, no longer than max-content, and its first
+;; line -- its schema -- is one the DNA allows. So nothing the DNA has not
+;; admitted can sit in the chain as an opaque hash, and a validator holding
+;; the documents sees every transfer the chain names.
+;;
+;; validate-dna takes one granted region:
+;;   [manifest mlen][chain n*454][record for entry 1]...[record for entry n-1]
+;; each record is [length: 2 bytes big-endian][document]. It answers n, or:
+;;   -15 a document is missing, or its sha256 is not the entry's content
+;;   -16 a document is longer than max-content
+;;   -17 a document's schema is not allowed by the DNA
+;;   -18 the genesis entry's content is not the DNA id
+;;   -19 the manifest is malformed or not canonical
+
+(defn- line-end [t :string from :i64] :i64
+  (string-index-of-from t "\n" from))
+
+;; index just past a "<prefix><1..64 printable>\n" line at `at`, or -1
+(defn- text-line [t :string at :i64 prefix :string] :i64
+  (if (= 0 (lit t at prefix))
+    -1
+    (let [from (+ at (string-byte-length prefix))
+          e (line-end t from)]
+      (if (< e 0) -1
+      (if (< (- e from) 1) -1
+      (if (> (- e from) 64) -1
+        (+ e 1)))))))
+
+;; walks allow lines from `at`; `prev` is the previous schema ("" before the
+;; first). Answers the index of the "end" line, or -1.
+(defn- allow-lines [t :string at :i64 prev :string count :i64] :i64
+  (if (= 1 (lit t at "allow:"))
+    (let [next (text-line t at "allow:")]
+      (if (< next 0)
+        -1
+        (let [schema (string-substring t (+ at 6) (- next 1))]
+          (if (= count 0)
+            (allow-lines t next schema (+ count 1))
+            (if (< (string-compare prev schema) 0)
+              (allow-lines t next schema (+ count 1))
+              -1)))))
+    (if (= count 0) -1 at)))
+
+;; max-content of a canonical manifest, or -19
+(defn- manifest-max-content [t :string] :i64
+  (if (= 0 (lit t 0 "kotoba.dna/v1\n"))
+    -19
+    (let [a (text-line t 14 "name:")
+          b (if (< a 0) -1 (text-line t a "version:"))]
+      (if (< b 0)
+        -19
+        (if (= 0 (lit t b "max-content:"))
+          -19
+          (let [from (+ b 12)
+                e (line-end t from)]
+            (if (< e 0) -19
+            (if (< (- e from) 1) -19
+            (if (> (- e from) 6) -19
+            (if (= 0 (digit-run t from 0 (- e from))) -19
+              (let [end-at (allow-lines t (+ e 1) "" 0)]
+                (if (< end-at 0) -19
+                (if (= 0 (lit t end-at "end\n")) -19
+                (if (= 0 (if (= (+ end-at 4) (string-byte-length t)) 1 0)) -19
+                  (decimal-at t from 0 (- e from) 0)))))))))))))))
+
+(defn- schema-allowed [manifest :string schema :string] :i64
+  (if (< (string-index-of manifest (string-concat "\nallow:" (string-concat schema "\n"))) 0) 0 1))
+
+(defn- entry-content [s [:slice :u8] at :i64] :string
+  (string-substring (entry-text s at) 293 357))
+
+;; checks the records for entries i..n-1 starting at byte `c`; answers the
+;; index just past the last record, or a negative reason
+(defn- dna-records [s [:slice :u8] len :i64 origin :i64 i :i64 n :i64 c :i64
+                    manifest :string max-content :i64] :i64
+  (if (>= i n)
+    c
+    (if (> (+ c 2) len)
+      -15
+      (let [l (+ (* 256 (slice-get s c)) (slice-get s (+ c 1)))
+            d (+ c 2)]
+        (if (< l 1) -15
+        (if (> (+ d l) len) -15
+        (if (> l max-content) -16
+        (if (= 0 (ascii-span s d 0 l)) -4
+          (let [doc (span-text s d l)
+                schema-end (line-end doc 0)]
+            (if (= 0 (same (sha256 doc) (entry-content s (+ origin (* i (entry-size)))))) -15
+            (if (< schema-end 1) -4
+            (if (= 0 (schema-allowed manifest (string-substring doc 0 schema-end))) -17
+              (dna-records s len origin (+ i 1) n (+ d l) manifest max-content)))))))))))))
+
+(defn validate-dna [base :i64 len :i64 n :i64 mlen :i64] :i64
+  (if (< n 1) -6
+  (if (< mlen 1) -6
+  (if (> (+ mlen (* n (entry-size))) len) -6
+    (let [s (slice-of-u8 base len)]
+      (if (= 0 (ascii-span s 0 0 mlen))
+        -19
+        (let [manifest (span-text s 0 mlen)
+              max-content (manifest-max-content manifest)]
+          (if (< max-content 0)
+            max-content
+            (let [verdict (walk s base mlen 0 n (key-hex-from s mlen 0) "")]
+              (if (< verdict 0)
+                verdict
+                (if (= 0 (same (entry-content s mlen) (sha256 manifest)))
+                  -18
+                  (let [end (dna-records s len mlen 1 n (+ mlen (* n (entry-size))) manifest max-content)]
+                    (if (< end 0) end
+                    (if (= end len) n -6))))))))))))))
