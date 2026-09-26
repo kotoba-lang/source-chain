@@ -1,17 +1,30 @@
 ;; Native qualification for kotoba.source-chain.
 ;;
-;; Compiles kotoba/source_chain.kotoba with amu for this host's native target,
-;; extracts the three exports, builds amu's C kexe loader, then builds signed
-;; entries on the host and asks the compiled guest through the loader. Every
-;; answer is pinned, including the reason code of each refusal; the two
-;; missing-grant rows pin that the guest TRAPS rather than answers.
+;; Compiles kotoba/source_chain.kotoba with amu for a native target, extracts
+;; the exports, builds amu's C kexe loader, then builds signed entries on the
+;; host and asks the compiled guest through the loader. Every answer is
+;; pinned, including the reason code of each refusal; the missing-grant rows
+;; pin that the guest TRAPS rather than answers.
 ;;
 ;; Ed25519 signing happens here, on the host, because signing is the key
 ;; holder's job (kagi in production). The guest only verifies.
 ;;
 ;; usage (from this repository's root):
-;;   kbb --backend sci qualification/native.cljk [--amu <amu checkout>]
+;;   kbb --backend sci qualification/native.cljk [--amu <dir>]
+;;       [--platform host|linux-podman] [--isa aarch64|x86_64]
 ;; default --amu is ../amu (the west layout: orgs/kotoba-lang/amu).
+;;
+;; --platform host (default): this machine's native target and a loader
+;;   built with cc; --isa must be the host's.
+;; --platform linux-podman: target <isa>-linux, run inside the podman
+;;   machine (the same VM amu's scripts/test-linux-static-handlers.cljk
+;;   uses). The loaders are built static in the localhost/c3-gcc container.
+;;   aarch64 runs the production loader with its seccomp filter in force;
+;;   x86_64 runs under qemu-x86_64-static with the loader built
+;;   -DKEXE_SANITIZER_TEST, because qemu-user cannot install a guest-arch
+;;   seccomp filter (amu measured the same). The kexe loader's shared-state
+;;   mmap needs vm.overcommit_memory=1 on the small VM; the run sets it and
+;;   puts the previous value back.
 ;;
 ;; exit 0: every row passed   1: a row failed   3: could not run (build,
 ;; toolchain or arguments) -- never reported as a pass.
@@ -33,18 +46,30 @@
     (when-not i (die "cannot find the script in argv" (pr-str argv)))
     (subvec argv (inc i))))
 
-(def amu-dir
-  (let [i (.indexOf (clj->js args) "--amu")]
-    (path/resolve (if (>= i 0) (nth args (inc i)) "../amu"))))
+(defn opt [flag default]
+  (let [i (.indexOf (clj->js args) flag)]
+    (if (>= i 0) (nth args (inc i) nil) default)))
 
-(def arch (case (os/arch) "arm64" "aarch64" "x64" "x86_64" (die "unsupported host arch" (os/arch))))
+(def amu-dir (path/resolve (opt "--amu" "../amu")))
+(def host-arch (case (os/arch) "arm64" "aarch64" "x64" "x86_64" nil))
+(def platform (opt "--platform" "host"))
+(def arch (opt "--isa" host-arch))
+(when-not (#{"host" "linux-podman"} platform) (die "unknown --platform" platform))
+(when-not (#{"aarch64" "x86_64"} arch) (die "unknown --isa" arch))
+(when (and (= platform "host") (not= arch host-arch))
+  (die "--platform host runs only the host ISA" host-arch "not" arch))
+(def linux? (= platform "linux-podman"))
+
+;; under /var/folders on macOS, which the podman machine mounts
 (def work (fs/mkdtempSync (path/join (os/tmpdir) "source-chain-native-")))
 
 (defn sh! [what cmd argv]
-  (let [r (cp/spawnSync cmd (clj->js argv) #js {:encoding "utf8"})]
+  (let [r (cp/spawnSync cmd (clj->js argv) #js {:encoding "utf8" :maxBuffer (* 16 1024 1024)})]
     (when (or (.-error r) (not= 0 (.-status r)))
       (die what "failed:" (str (.-error r)) (str/trim (str (.-stdout r) (.-stderr r)))))
     (str (.-stdout r))))
+
+(defn vm! [what command] (sh! what "podman" ["machine" "ssh" command]))
 
 ;; --- build -------------------------------------------------------------------
 
@@ -56,7 +81,8 @@
 (def policy (path/join work "policy.edn"))
 (fs/writeFileSync policy "{:allow #{[:cap/call 2] [:cap/call 3]}}")
 (def kexe (path/join work "source-chain.kexe"))
-(sh! "amu compile" amu ["compile" guest "--policy" policy "--output" kexe])
+(sh! "amu compile" amu (concat ["compile" guest "--policy" policy "--output" kexe]
+                               (when linux? ["--target" (str arch "-linux")])))
 
 (def code (path/join work "source-chain.bin"))
 (def offsets
@@ -70,8 +96,36 @@
   (die "could not read offsets" (pr-str offsets)))
 
 (def loader (path/join work "kexe-loader"))
-(sh! "cc kexe_loader.c" "cc" ["-O2" "-o" loader (path/join amu-dir "tools/kexe_loader.c")])
+(fs/copyFileSync (path/join amu-dir "tools/kexe_loader.c") (path/join work "kexe_loader.c"))
+(if linux?
+  (vm! "building the Linux loader"
+       (str "podman run --rm -v " work ":" work " localhost/c3-gcc sh -c 'cd " work " && "
+            (if (= arch "aarch64")
+              "gcc -std=c11 -O2 -static kexe_loader.c -o kexe-loader"
+              "x86_64-linux-gnu-gcc -std=c11 -O2 -static -DKEXE_SANITIZER_TEST kexe_loader.c -o kexe-loader")
+            "'"))
+  (sh! "cc kexe_loader.c" "cc" ["-O2" "-o" loader (path/join work "kexe_loader.c")]))
 
+(def overcommit-before
+  (when linux?
+    (let [v (str/trim (vm! "reading vm.overcommit_memory" "sysctl -n vm.overcommit_memory"))]
+      (vm! "setting vm.overcommit_memory" "sudo sysctl -q -w vm.overcommit_memory=1")
+      v)))
+
+;; what a missing grant looks like: the emitted mask check traps with the
+;; ISA's trap instruction (brk on aarch64, ud2 on x86_64 -- amu measured both)
+(def grant-trap (if (= arch "x86_64") "SIGILL" "SIGTRAP"))
+
+(defn exec-loader [argv]
+  (if linux?
+    (let [r (cp/spawnSync "podman"
+                          #js ["machine" "ssh"
+                               (str (when (= arch "x86_64") "qemu-x86_64-static ")
+                                    (str/join " " (cons loader argv)))]
+                          #js {:encoding "utf8" :maxBuffer (* 16 1024 1024)})]
+      (str/trim (str (.-stdout r) (.-stderr r))))
+    (let [r (cp/spawnSync loader (clj->js argv) #js {:encoding "utf8"})]
+      (str/trim (str (.-stdout r) (.-stderr r))))))
 ;; --- entries -----------------------------------------------------------------
 
 (defn hex [^js buf] (.toString buf "hex"))
@@ -126,9 +180,8 @@
    (let [{:keys [offset arity]} (get offsets sym)
          argv (concat [code (str offset) (str arity) arch allow]
                       (mapcat (fn [i r] [(str "g:" r) (str "gl:" i)]) (range) regions)
-                      (map str extra))
-         r (cp/spawnSync loader (clj->js argv) #js {:encoding "utf8"})]
-     (str/trim (str (.-stdout r) (.-stderr r))))))
+                      (map str extra))]
+     (exec-loader argv))))
 
 (defn utf8-hex [s] (hex (js/Buffer.from s "utf8")))
 
@@ -393,9 +446,9 @@
              (run D G [region] [n 100000]))
            "-6"))
   (check "without the verify grant the guest traps, it does not answer"
-         (str/includes? (run V "3" [(hex-of three)]) "SIGTRAP") true)
+         (str/includes? (run V "3" [(hex-of three)]) grant-trap) true)
   (check "without the sha256 grant the guest traps, it does not answer"
-         (str/includes? (run V "2" [(hex-of three)]) "SIGTRAP") true))
+         (str/includes? (run V "2" [(hex-of three)]) grant-trap) true))
 
 (let [rs @results
       bad (remove :ok rs)]
@@ -403,6 +456,8 @@
     (println (if (:ok r) "PASS" "FAIL") (:label r)
              (if (:ok r) "" (str "  actual=" (pr-str (:actual r)) " expected=" (pr-str (:expected r))))))
   (println (str "SCANNED\t" (count rs) "\tPASSED\t" (- (count rs) (count bad)) "\tFAILED\t" (count bad)
-                "\tTARGET\t" arch))
+                "\tTARGET\t" arch "\tPLATFORM\t" platform))
+  (when overcommit-before
+    (vm! "restoring vm.overcommit_memory" (str "sudo sysctl -q -w vm.overcommit_memory=" overcommit-before)))
   (fs/rmSync work #js {:recursive true :force true})
   (js/process.exit (cond (zero? (count rs)) 3 (seq bad) 1 :else 0)))
